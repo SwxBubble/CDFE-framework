@@ -1,7 +1,7 @@
 // modified from https://github.com/dat-ecosystem-archive/rabin/blob/master/src/rabin.h
 #pragma once
 #include <cstdint>
-constexpr int WINSIZE = 48;
+constexpr int WINSIZE = 16;
 
 struct rabin_t {
   uint8_t window[WINSIZE];

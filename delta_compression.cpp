@@ -13,7 +13,10 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <chrono>
+
 namespace Delta {
+  /*
 void DeltaCompression::AddFile(const std::string &file_name) {
   FileMeta file_meta;
   file_meta.file_name = file_name;
@@ -64,7 +67,114 @@ void DeltaCompression::AddFile(const std::string &file_name) {
     file_meta.end_chunk_id = chunk->id();
   }
   file_meta_writer_.Write(file_meta);
+}*/
+
+void DeltaCompression::AddFile(const std::string &file_name) {
+  using Clock = std::chrono::steady_clock;
+  auto elapsed_ms = [](Clock::time_point s, Clock::time_point e) -> double {
+    return std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(e - s).count();
+  };
+
+  const auto file_t0 = Clock::now();
+  double dedup_ms = 0.0;
+  double delta_after_dedup_ms = 0.0;
+  double dup_write_ms = 0.0;
+
+  uint64_t total_chunks = 0;
+  uint64_t duplicate_chunks = 0;
+  uint64_t unique_chunks = 0;
+
+  FileMeta file_meta;
+  file_meta.file_name = file_name;
+  file_meta.start_chunk_id = -1;
+  this->chunker_->ReinitWithFile(file_name);
+
+  while (true) {
+    auto chunk = chunker_->GetNextChunk();
+    if (nullptr == chunk)
+      break;
+
+    total_chunks++;
+
+    if (-1 == file_meta.start_chunk_id)
+      file_meta.start_chunk_id = chunk->id();
+
+    // ---- 1) 去重计时（dedup_->ProcessChunk）----
+    const auto t_dedup0 = Clock::now();
+    uint32_t dedup_base_id = dedup_->ProcessChunk(chunk);
+    dedup_ms += elapsed_ms(t_dedup0, Clock::now());
+
+    total_size_origin_ += chunk->len();
+
+    // duplicate chunk
+    if (dedup_base_id != chunk->id()) {
+      duplicate_chunks++;
+
+      // （可选）重复块写入时间：不算“增量压缩”，但属于去重后的处理
+      const auto t_dup0 = Clock::now();
+      storage_->WriteDuplicateChunk(chunk, dedup_base_id);
+      dup_write_ms += elapsed_ms(t_dup0, Clock::now());
+
+      duplicate_chunk_count_++;
+      continue;
+    }
+
+    unique_chunks++;
+
+    // ---- 2) 去重后增量压缩计时：feature/index/delta encode/write ----
+    const auto t_delta0 = Clock::now();
+
+    auto write_base_chunk = [this](const std::shared_ptr<Chunk> &chunk) {
+      storage_->WriteBaseChunk(chunk);
+      base_chunk_count_++;
+      total_size_compressed_ += chunk->len();
+    };
+
+    auto write_delta_chunk = [this](const std::shared_ptr<Chunk> &chunk,
+                                    const std::shared_ptr<Chunk> &delta_chunk,
+                                    const uint32_t base_chunk_id) {
+      chunk_size_before_delta_ += chunk->len();
+      storage_->WriteDeltaChunk(delta_chunk, base_chunk_id);
+      delta_chunk_count_++;
+      chunk_size_after_delta_ += delta_chunk->len();
+      total_size_compressed_ += delta_chunk->len();
+    };
+
+    auto feature = (*feature_)(chunk);
+    auto base_chunk_id = index_->GetBaseChunkID(feature);
+    if (!base_chunk_id.has_value()) {
+      index_->AddFeature(feature, chunk->id());
+      write_base_chunk(chunk);
+
+      delta_after_dedup_ms += elapsed_ms(t_delta0, Clock::now());
+      continue;
+    }
+
+    auto delta_chunk =
+        storage_->GetDeltaEncodedChunk(chunk, base_chunk_id.value());
+    write_delta_chunk(chunk, delta_chunk, base_chunk_id.value());
+    file_meta.end_chunk_id = chunk->id();
+
+    delta_after_dedup_ms += elapsed_ms(t_delta0, Clock::now());
+  }
+
+  file_meta_writer_.Write(file_meta);
+
+  const auto file_t1 = Clock::now();
+  const double total_ms = elapsed_ms(file_t0, file_t1);
+
+  LOG(INFO) << "[TIME] AddFile finished: file=" << file_name
+            << " total=" << total_ms << " ms"
+            << " dedup=" << dedup_ms << " ms"
+            << " delta_after_dedup=" << delta_after_dedup_ms << " ms"
+            << " dup_write=" << dup_write_ms << " ms"
+            << " chunks(total=" << total_chunks
+            << ", unique=" << unique_chunks
+            << ", dup=" << duplicate_chunks << ")";
 }
+
+
+
 
 DeltaCompression::~DeltaCompression() {
   auto print_ratio = [](size_t a, size_t b) {
@@ -88,6 +198,8 @@ DeltaCompression::~DeltaCompression() {
             << " after: " << total_size_compressed_ << std::endl;
   std::cout << "DCE (Delta Compression Efficiency): ";
   print_ratio(chunk_size_after_delta_, chunk_size_before_delta_);
+  std::cout << "chunk_size_after_delta: "<<chunk_size_after_delta_
+            << "  chunk_size_before_delta: "<<chunk_size_before_delta_<< std::endl;
 }
 
 #define declare_feature_type(NAME, FEATURE, INDEX)                             \
@@ -141,7 +253,12 @@ DeltaCompression::DeltaCompression() {
           declare_feature_type(n-transform, NTransformFeature,
                                SuperFeatureIndex),
           declare_feature_type(palantir, PalantirFeature, PalantirIndex),
-          declare_feature_type(bestfit, OdessSubfeatures, BestFitIndex)};
+          declare_feature_type(bestfit, OdessSubfeatures, BestFitIndex),
+          declare_feature_type(cdfe, CDFEFeature, SuperFeatureIndex) // CDFE 聚合
+          //declare_feature_type(cdfe, CDFEFeature, BestFitIndex) // CDFE 非聚合
+
+        };
+          
 
   if (!feature_index_map.count(feature_type))
     LOG(FATAL) << "Unknown feature type " << feature_type;
